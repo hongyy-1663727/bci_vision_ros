@@ -1,0 +1,192 @@
+# Use conda environment with Python 3.8 (yolo_env)
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+from ultralytics import YOLO
+import time
+import random
+import torch
+
+# Initialize RealSense Camera
+pipeline = rs.pipeline()
+config = rs.config()
+
+# Enable depth and color streams
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+# Start streaming
+pipeline.start(config)
+
+# Align depth to color
+align = rs.align(rs.stream.color)
+
+# Load YOLOv8 segmentation model
+model = YOLO('yolo11n-seg.pt')  # Ensure this is a segmentation-enabled model
+
+# Initialize ArUco Detector
+aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_ARUCO_ORIGINAL)
+parameters = cv2.aruco.DetectorParameters_create()
+
+# Assign unique colors to each class
+random.seed(42)  # For reproducibility
+
+def generate_unique_colors(num_colors):
+    colors = []
+    for i in range(num_colors):
+        # Generate bright colors
+        color = tuple(random.randint(0, 255) for _ in range(3))
+        colors.append(color)
+    return colors
+
+# Get the number of classes
+num_classes = len(model.names)
+
+# Generate colors
+unique_colors = generate_unique_colors(num_classes)
+
+# Create a dictionary mapping class names to colors
+COLORS = {class_name: color for class_name, color in zip(model.names.values(), unique_colors)}
+
+def calculate_center(box):
+    """
+    Calculate the center (x, y) of the bounding box.
+    box: list or array with [x1, y1, x2, y2]
+    """
+    x1, y1, x2, y2 = box
+    center_x = int((x1 + x2) / 2)
+    center_y = int((y1 + y2) / 2)
+    return center_x, center_y
+
+def get_distance(depth_frame, center):
+    """
+    Get the distance in meters from the depth frame at the center point.
+    depth_frame: depth frame from RealSense
+    center: (x, y) tuple
+    """
+    depth = depth_frame.get_distance(center[0], center[1])
+    return depth  # Distance in meters
+
+try:
+    while True:
+        # Wait for a coherent pair of frames: depth and color
+        frames = pipeline.wait_for_frames()
+        aligned_frames = align.process(frames)
+        depth_frame = aligned_frames.get_depth_frame()
+        color_frame = aligned_frames.get_color_frame()
+        if not depth_frame or not color_frame:
+            continue
+
+        # Convert images to numpy arrays
+        depth_image = np.asanyarray(depth_frame.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+
+        # Create an overlay for shading
+        overlay = color_image.copy()
+
+        # Detect objects using YOLOv8 with segmentation
+        results = model.predict(source=color_image, verbose=False)
+
+        # Process YOLO detections
+        for result in results:
+            boxes = result.boxes  # Bounding boxes
+            masks = result.masks  # Segmentation masks
+
+            # Ensure masks are present
+            if masks is None:
+                continue
+
+            # Convert masks to numpy if they are tensors
+            if isinstance(masks.data, torch.Tensor):
+                masks_data = masks.data.cpu().numpy()
+            else:
+                masks_data = masks.data
+
+            for box, mask in zip(boxes, masks_data):
+                # Get box coordinates
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                confidence = box.conf[0].cpu().numpy()
+                class_id = int(box.cls[0].cpu().numpy())
+                label = model.names[class_id]
+
+                # Calculate center point
+                center_x, center_y = calculate_center([x1, y1, x2, y2])
+
+                # Get distance
+                distance = get_distance(depth_frame, (center_x, center_y))
+
+                # Define mask color based on class
+                mask_color = COLORS.get(label, (0, 255, 0))  # Default to green if class not found
+                alpha = 0.4  # Transparency factor
+
+                # Convert mask to binary format
+                mask_binary = (mask > 0.5).astype(np.uint8) * 255  # Thresholding
+
+                # Resize mask to match the frame size if necessary
+                mask_binary = cv2.resize(mask_binary, (color_image.shape[1], color_image.shape[0]))
+
+                # Create a colored mask
+                colored_mask = np.zeros_like(color_image, dtype=np.uint8)
+                colored_mask[:] = mask_color
+
+                # Apply the mask to the overlay
+                overlay = cv2.bitwise_or(overlay, colored_mask, mask=mask_binary)
+
+                # Draw bounding box
+                cv2.rectangle(color_image, (x1, y1), (x2, y2), mask_color, 2)
+
+                # Put label and distance with background for readability
+                text = f"{label} {confidence:.2f} {distance:.2f}m"
+                (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(color_image, (x1, y1 - 25), (x1 + text_width, y1 - 5), mask_color, -1)
+                cv2.putText(color_image, text, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+                # Draw center point
+                cv2.circle(color_image, (center_x, center_y), 5, (0, 0, 255), -1)
+
+        # Apply the overlay with transparency
+        cv2.addWeighted(overlay, alpha, color_image, 1 - alpha, 0, color_image)
+
+        # Detect ArUco tags
+        gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+        corners, ids, rejectedImgPoints = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
+            for i, corner in enumerate(corners):
+                # Calculate center of ArUco tag
+                corner = corner.reshape((4, 2))
+                (topLeft, topRight, bottomRight, bottomLeft) = corner
+                center_x = int((topLeft[0] + bottomRight[0]) / 2)
+                center_y = int((topLeft[1] + bottomRight[1]) / 2)
+
+                # Get distance
+                distance = get_distance(depth_frame, (center_x, center_y))
+
+                # Draw center point
+                cv2.circle(color_image, (center_x, center_y), 5, (255, 0, 0), -1)
+
+                # Put ID and distance with background for readability
+                aruco_id = ids[i][0]
+                text = f"ID:{aruco_id} {distance:.2f}m"
+                (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(color_image, (center_x + 10, center_y - 15), 
+                              (center_x + 10 + text_width, center_y + baseline - 5), 
+                              (255, 0, 0), -1)
+                cv2.putText(color_image, text, (center_x + 10, center_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+        # Display the resulting frame
+        cv2.imshow('RealSense', color_image)
+
+        # Break the loop on 'q' key press
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    pass
+finally:
+    # Stop streaming
+    pipeline.stop()
+    cv2.destroyAllWindows()
